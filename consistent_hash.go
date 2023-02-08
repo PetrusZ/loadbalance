@@ -1,0 +1,90 @@
+package loadbalance
+
+import (
+	"errors"
+	"hash/crc32"
+	"sort"
+	"strconv"
+	"sync"
+)
+
+//请求固定的URL访问指定的IP
+
+type Hash func(data []byte) uint32
+
+type UInt32Slice []uint32
+
+func (s UInt32Slice) Len() int {
+	return len(s)
+}
+
+func (s UInt32Slice) Less(i, j int) bool {
+	return s[i] < s[j]
+}
+
+func (s UInt32Slice) Swap(i, j int) {
+	s[i], s[j] = s[j], s[i]
+}
+
+type ConsistentHashLB struct {
+	hash     Hash
+	replicas int               // 复制因子
+	keys     UInt32Slice       // 已排序的节点hash切片
+	hashMap  map[uint32]string // 节点哈希和key的map，键是hash值，值是节点key
+	mutex    sync.RWMutex
+}
+
+func NewConsistentHashLB(replicas int, fn Hash) *ConsistentHashLB {
+	m := &ConsistentHashLB{
+		replicas: replicas,
+		hash:     fn,
+	}
+
+	if m.hash == nil {
+		//最多32位，保证是一个2^32-1环
+		m.hash = crc32.ChecksumIEEE
+	}
+	return m
+}
+
+func (lb *ConsistentHashLB) IsEmpty() bool {
+	return len(lb.keys) == 0
+}
+
+// Add 方法用来添加缓存节点，参数为节点key，比如使用IP
+func (lb *ConsistentHashLB) Add(ip string) error {
+	lb.mutex.Lock()
+	defer lb.mutex.Unlock()
+
+	// 结合复制因子计算所有虚拟节点的hash值，并存入m.keys中，同时在m.hashMap中保存哈希值和key的映射
+	for i := 0; i < lb.replicas; i++ {
+		hash := lb.hash([]byte(strconv.Itoa(i) + ip))
+		lb.keys = append(lb.keys, hash)
+		lb.hashMap[hash] = ip
+	}
+
+	// 对所有虚拟节点的哈希值进行排序，方便之后进行二分查找
+	sort.Sort(lb.keys)
+	return nil
+}
+
+// Get 方法根据给定的对象获取最靠近它的那个节点
+func (lb *ConsistentHashLB) Get(key string) (string, error) {
+	if lb.IsEmpty() {
+		return "", errors.New("node is empty")
+	}
+	hash := lb.hash([]byte(key))
+
+	// 通过二分查找获取最优节点，第一个"服务器hash"值大于"数据hash"值的就是最优"服务器节点"
+	idx := sort.Search(len(lb.keys), func(i int) bool {
+		return lb.keys[i] >= hash
+	})
+
+	// 如果查找结果 大于 服务器节点哈希数组的最大索引，表示此时该对象哈希值位于最后一个节点之后，那么放入第一个节点中
+	if idx == len(lb.keys) {
+		idx = 0
+	}
+	lb.mutex.RLock()
+	defer lb.mutex.RUnlock()
+	return lb.hashMap[lb.keys[idx]], nil
+}
